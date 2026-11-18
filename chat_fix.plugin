@@ -1,0 +1,820 @@
+# -*- coding: utf-8 -*-
+"""Local chat positions for AyuGram / exteraGram. Python 3.11, SDK 1.4.4.3.
+
+The controller's chronological lists and Telegram pin flags remain authoritative.
+Only DialogsActivity receives a reordered projection. Native pin dragging is
+translated back to the original list; local dragging never enters that path.
+Desktop tests cover the state and hook boundary; Android must be tested on device.
+"""
+
+import json
+import threading
+import traceback
+
+from java import jclass, jint, jfloat
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread, copy_to_clipboard
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field
+from ui.settings import Header, Switch, Text, Divider
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+__id__ = "chat_fix"
+__name__ = "Фиксация чатов"
+__description__ = "Фиксация одного или нескольких чатов на текущих местах, ручное перемещение и режим «Зафиксировать все»."
+__author__ = "@Demon_In_Moscow"
+__version__ = "0.1.1"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=13.1.1"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = "chats"
+
+ArrayList = jclass("java.util.ArrayList")
+WeakReference = jclass("java.lang.ref.WeakReference")
+System = jclass("java.lang.System")
+Integer = jclass("java.lang.Integer")
+UserConfig = jclass("org.telegram.messenger.UserConfig")
+MessagesController = jclass("org.telegram.messenger.MessagesController")
+DialogObject = jclass("org.telegram.messenger.DialogObject")
+DialogCell = jclass("org.telegram.ui.Cells.DialogCell")
+Theme = jclass("org.telegram.ui.ActionBar.Theme")
+LocaleController = jclass("org.telegram.messenger.LocaleController")
+AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+
+FIX_ITEM = 1834702101
+UNFIX_ITEM = 1834702102
+ALL_ITEM = 1834702103
+STATE_KEY = "positions_v1"
+REFLECTION_FIELDS = {}
+
+
+def reflection_class(target):
+    """Accept either an SDK Class object or a Chaquopy Python Java type.
+
+    Chaquopy represents find_class results as Python types in some app builds.
+    Its documented equivalent of Java's Foo.class is Foo.getClass(). Calling
+    getClass on an existing java.lang.Class would instead reflect Class itself.
+    """
+    return target.getClass() if isinstance(target, type) else target
+
+
+def field(obj, name, default=None):
+    if obj is None:
+        return default
+    try:
+        return getattr(obj, name)
+    except Exception:
+        value = get_private_field(obj, name)
+        return default if value is None else value
+
+
+def put(obj, name, value):
+    clazz = obj.getClass()
+    key = str(clazz.getName()), name
+    member = REFLECTION_FIELDS.get(key)
+    if member is None:
+        while clazz is not None:
+            try:
+                member = clazz.getDeclaredField(name)
+                member.setAccessible(True)
+                break
+            except Exception:
+                clazz = clazz.getSuperclass()
+        if member is None:
+            raise RuntimeError("Недоступно поле " + name)
+        REFLECTION_FIELDS[key] = member
+    kind = str(member.getType().getName())
+    if kind == "boolean":
+        member.setBoolean(obj, bool(value))
+    elif kind == "int":
+        member.setInt(obj, jint(int(value)))
+    elif kind == "float":
+        member.setFloat(obj, jfloat(float(value)))
+    else:
+        member.set(obj, value)
+
+
+def items(values):
+    return [] if values is None else [values.get(i) for i in range(values.size())]
+
+
+def identity(obj):
+    return int(System.identityHashCode(obj))
+
+
+def normal_dialog(dialog):
+    did = int(field(dialog, "id", 0))
+    if not did or DialogObject.isFolderDialogId(did):
+        return False
+    return str(dialog.getClass().getSimpleName()) not in ("TL_dialogCommunity", "DialogsHeader")
+
+
+def fill_slots(incoming, fixed):
+    """Keep present anchors at their slots; preserve ordinary chronological order.
+
+    Remembered positions are never rewritten because pagination, filtering or a
+    deletion temporarily leaves fewer visible chats. Crowded tail anchors retain
+    their relative order instead of reversing when their slots are out of range.
+    """
+    incoming = [str(did) for did in incoming]
+    ranks = {did: i for i, did in enumerate(incoming)}
+    anchors = sorted((int(slot), ranks[did], did) for did, slot in fixed.items() if did in ranks)
+    if not anchors:
+        return incoming
+    result = [None] * len(incoming)
+    previous = -1
+    for index, (slot, _, did) in enumerate(anchors):
+        position = min(max(slot, previous + 1), len(incoming) - len(anchors) + index)
+        result[position] = did
+        previous = position
+    anchored = {did for _, _, did in anchors}
+    ordinary = iter(did for did in incoming if did not in anchored)
+    return [next(ordinary) if did is None else did for did in result]
+
+
+class Positions:
+    """Account IDs and stable filter IDs, never selected-account slot numbers."""
+
+    def __init__(self, raw=None):
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        self.data = data or {"schema": 1, "accounts": {}}
+        if not isinstance(self.data, dict) or self.data.get("schema") != 1:
+            raise ValueError("Неподдерживаемый формат сохранённых позиций")
+        if not isinstance(self.data.get("accounts"), dict):
+            raise ValueError("Повреждён список аккаунтов")
+        for account in self.data["accounts"].values():
+            if not isinstance(account, dict) or not isinstance(account.get("contexts"), dict):
+                raise ValueError("Повреждены настройки аккаунта")
+            if not isinstance(account.get("all"), bool):
+                raise ValueError("Повреждён режим фиксации")
+            for context in account["contexts"].values():
+                if not isinstance(context, dict) or not isinstance(context.get("fixed"), dict):
+                    raise ValueError("Повреждены позиции чатов")
+                for did, slot in context["fixed"].items():
+                    int(did)
+                    if not isinstance(slot, int) or isinstance(slot, bool) or slot < 0:
+                        raise ValueError("Повреждён номер позиции")
+                order = context.get("order")
+                if not isinstance(order, list) or len(set(order)) != len(order):
+                    raise ValueError("Повреждён порядок чатов")
+                for did in order:
+                    if not isinstance(did, str):
+                        raise ValueError("Повреждён идентификатор чата")
+                    int(did)
+        self.dirty = False
+
+    def account(self, uid, create=False):
+        uid = str(uid)
+        accounts = self.data["accounts"]
+        if create and uid not in accounts:
+            accounts[uid] = {"all": False, "contexts": {}}
+            self.dirty = True
+        return accounts.get(uid)
+
+    def context(self, uid, key, create=False):
+        account = self.account(uid, create)
+        if account is None:
+            return None
+        if create and key not in account["contexts"]:
+            account["contexts"][key] = {"fixed": {}, "order": []}
+            self.dirty = True
+        return account["contexts"].get(key)
+
+    def all(self, uid):
+        return bool((self.account(uid) or {}).get("all", False))
+
+    def fixed(self, uid, key, did):
+        context = self.context(uid, key)
+        return self.all(uid) or bool(context and str(did) in context["fixed"])
+
+    def marked(self, uid, key, did):
+        context = self.context(uid, key)
+        return not self.all(uid) and bool(context and str(did) in context["fixed"])
+
+    def arrange(self, uid, key, incoming):
+        incoming = [str(did) for did in incoming]
+        if self.all(uid):
+            context = self.context(uid, key, True)
+            known = set(context["order"])
+            added = [did for did in incoming if did not in known]
+            if added:
+                context["order"].extend(added)
+                self.dirty = True
+            present = set(incoming)
+            return [did for did in context["order"] if did in present]
+        context = self.context(uid, key)
+        return fill_slots(incoming, context["fixed"]) if context else incoming
+
+    def fix(self, uid, key, visible, selected):
+        context = self.context(uid, key, True)
+        ranks = {str(did): i for i, did in enumerate(visible)}
+        for did in selected:
+            did = str(did)
+            if did in ranks:
+                context["fixed"][did] = ranks[did]
+                self.dirty = True
+
+    def unfix(self, uid, key, selected):
+        context = self.context(uid, key)
+        if context:
+            for did in selected:
+                if str(did) in context["fixed"]:
+                    del context["fixed"][str(did)]
+                    self.dirty = True
+
+    def set_all(self, uid, enabled, snapshots):
+        account = self.account(uid, True)
+        if enabled:
+            # Restart from the actual visible layout, including individual fixes.
+            for context in account["contexts"].values():
+                context["order"] = []
+            for key, order in snapshots.items():
+                self.context(uid, key, True)["order"] = list(dict.fromkeys(str(d) for d in order))
+        account["all"] = bool(enabled)
+        self.dirty = True
+
+    def move(self, uid, key, visible, source, target):
+        visible = [str(did) for did in visible]
+        source, target = str(source), str(target)
+        if source == target or source not in visible or target not in visible:
+            return False
+        if not self.fixed(uid, key, source):
+            return False
+        destination = visible.index(target)
+        moved = list(visible)
+        moved.insert(destination, moved.pop(moved.index(source)))
+        context = self.context(uid, key, True)
+        if self.all(uid):
+            self.arrange(uid, key, visible)
+            # Replace only present entries. Unloaded or temporarily hidden chats
+            # retain their place in the full saved order.
+            present = set(visible)
+            iterator = iter(moved)
+            context["order"] = [next(iterator) if did in present else did for did in context["order"]]
+        ranks = {did: i for i, did in enumerate(moved)}
+        for did in context["fixed"]:
+            if did in ranks:
+                context["fixed"][did] = ranks[did]
+        self.dirty = True
+        return True
+
+    def clear(self, uid):
+        self.data["accounts"].pop(str(uid), None)
+        self.dirty = True
+
+    def dump(self):
+        return json.dumps(self.data, ensure_ascii=False, separators=(",", ":"))
+
+
+class Callback(MethodHook):
+    def __init__(self, plugin, label, before=None, after=None):
+        self.plugin, self.label = plugin, label
+        self.before, self.after = before, after
+
+    def before_hooked_method(self, param):
+        if self.plugin.alive and self.before:
+            try:
+                self.before(param)
+            except Exception:
+                self.plugin.error(self.label)
+
+    def after_hooked_method(self, param):
+        if self.plugin.alive and self.after:
+            try:
+                self.after(param)
+            except Exception:
+                self.plugin.error(self.label)
+
+
+class ChatFixPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.alive = False
+        self.screens, self.cells, self.position_hooks, self.errors = {}, {}, [], []
+        self.menus = {}
+        self.guard = threading.local()
+        self.save_pending = False
+        self.model = Positions(self.get_setting(STATE_KEY, None))
+        self.alive = True
+        try:
+            self.wire("org.telegram.ui.DialogsActivity", "getDialogsArray", 4, after=self.project, required=True)
+            self.wire("org.telegram.ui.DialogsActivity", "updateCounters", 1, after=self.selection_changed, required=True)
+            self.wire("org.telegram.ui.DialogsActivity", "createActionMode", 1, after=self.selection_changed)
+            self.wire("org.telegram.ui.DialogsActivity", "showOrUpdateActionMode", 2, after=self.selection_changed, required=True)
+            self.wire("org.telegram.ui.DialogsActivity", "hideActionMode", 1, after=self.selection_changed)
+            self.wire("org.telegram.ui.DialogsActivity", "onResume", 0, after=self.resumed)
+            self.wire("org.telegram.ui.ActionBar.ActionBarMenu", "onItemClick", 1, before=self.menu_dispatch, required=True)
+            self.wire("org.telegram.ui.Cells.DialogCell", "getIsPinned", 0, after=self.pin_visual, required=True)
+            self.wire("org.telegram.ui.Cells.DialogCell", "setDialog", None, before=self.cell_before, after=self.cell_after, required=True)
+            self.wire("org.telegram.ui.Cells.DialogCell", "buildLayout", 0, after=self.cell_after)
+            self.wire("org.telegram.ui.Cells.DialogCell", "onReorderStateChanged", 2, before=self.reorder_visual, required=True)
+            self.wire("org.telegram.ui.Cells.DialogCell", "onDetachedFromWindow", 0, after=self.cell_detached)
+            self.wire("org.telegram.ui.DialogsActivity$SwipeController", "getMovementFlags", 2, before=self.movement, required=True)
+            self.wire("org.telegram.ui.DialogsActivity$SwipeController", "onMove", 3, before=self.drag, required=True)
+            self.wire("org.telegram.ui.Adapters.DialogsAdapter", "moveDialogs", 3, before=self.native_move, required=True)
+        except Exception:
+            self.alive = False
+            for hook in self.position_hooks:
+                self.unhook_method(hook)
+            self.position_hooks.clear()
+            raise
+        run_on_ui_thread(self.bootstrap)
+
+    def wire(self, classname, name, count, before=None, after=None, required=False):
+        clazz = reflection_class(find_class(classname))
+        found = 0
+        if clazz is not None:
+            for method in clazz.getDeclaredMethods():
+                if str(method.getName()) != name or (count is not None and len(method.getParameterTypes()) != count) or method.isBridge():
+                    continue
+                method.setAccessible(True)
+                handle = self.hook_method(method, Callback(self, classname + "." + name, before, after))
+                if handle is not None:
+                    self.position_hooks.append(handle)
+                    found += 1
+        if required and not found:
+            raise RuntimeError("Эта сборка не поддерживается: " + classname + "." + name)
+
+    def error(self, label):
+        detail = label + "\n" + traceback.format_exc()
+        if not self.errors or self.errors[-1] != detail:
+            self.errors.append(detail)
+            self.errors = self.errors[-8:]
+            self.log(detail)
+
+    def eligible(self, screen):
+        return (screen is not None and str(screen.getClass().getName()) == "org.telegram.ui.DialogsActivity"
+                and not bool(field(screen, "onlySelect", False))
+                and int(field(screen, "initialDialogsType", 0)) == 0
+                and int(field(screen, "communityId", 0)) == 0
+                and not bool(field(screen, "isReplyTo", False)))
+
+    def context(self, screen, account, dtype, folder):
+        if not self.eligible(screen) or dtype not in (0, 7, 8):
+            return None
+        uid = str(UserConfig.getInstance(account).getClientUserId())
+        if uid == "0":
+            return None
+        if dtype in (7, 8):
+            selected = MessagesController.getInstance(account).selectedDialogFilter
+            filter_obj = selected[1 if dtype == 8 else 0]
+            if filter_obj is not None:
+                return uid, "filter:" + str(filter_obj.id)
+        return uid, "folder:" + str(folder)
+
+    def remember(self, screen):
+        if self.eligible(screen):
+            self.screens[identity(screen)] = WeakReference(screen)
+
+    def current_page(self, screen):
+        pages = field(screen, "viewPages")
+        return pages[0] if pages is not None and len(pages) else None
+
+    def page_context(self, screen, page):
+        return self.context(screen, int(screen.getCurrentAccount()), int(field(page, "dialogsType", -1)), int(field(screen, "folderId", 0)))
+
+    def raw_dialogs(self, screen, account, dtype, folder):
+        previous = getattr(self.guard, "raw", False)
+        self.guard.raw = True
+        try:
+            return screen.getDialogsArray(account, dtype, folder, False)
+        finally:
+            self.guard.raw = previous
+
+    def project(self, param):
+        if getattr(self.guard, "raw", False) or bool(param.args[3]):
+            return
+        account, dtype, folder = (int(param.args[i]) for i in range(3))
+        context = self.context(param.thisObject, account, dtype, folder)
+        original = param.getResult()
+        if context is None or original is None:
+            return
+        uid, key = context
+        if not self.model.all(uid) and not self.model.context(uid, key):
+            return
+        source = items(original)
+        slots = [i for i, d in enumerate(source) if normal_dialog(d)]
+        chats = [source[i] for i in slots]
+        ids = [str(d.id) for d in chats]
+        if len(set(ids)) != len(ids):
+            return
+        ordered = self.model.arrange(uid, key, ids)
+        self.save_later()
+        if ordered == ids:
+            return
+        lookup = {str(d.id): d for d in chats}
+        result = ArrayList(original)
+        for position, did in zip(slots, ordered):
+            result.set(position, lookup[did])
+        param.setResult(result)
+
+    def cell_before(self, param):
+        cell = param.thisObject
+        self.cells[identity(cell)] = None
+        if len(param.args) != 3:
+            return
+        dialog = param.args[0]
+        if not normal_dialog(dialog):
+            return
+        screen = field(cell, "parentFragment")
+        account = int(field(cell, "currentAccount", -1))
+        if account < 0:
+            return
+        context = self.context(screen, account, int(param.args[1]), int(param.args[2]))
+        if context:
+            if len(self.cells) > 1024:
+                self.cells.clear()
+            self.cells[identity(cell)] = (context[0], context[1], str(dialog.id))
+
+    def cell_context(self, cell):
+        cell_id = identity(cell)
+        if cell_id in self.cells:
+            return self.cells[cell_id]
+        if not bool(field(cell, "isDialogCell", False)):
+            return None
+        if int(field(cell, "currentDialogCommunityId", 0)) != 0:
+            return None
+        screen = field(cell, "parentFragment")
+        account = int(field(cell, "currentAccount", -1))
+        did = int(cell.getDialogId())
+        if account < 0 or not did or DialogObject.isFolderDialogId(did):
+            return None
+        context = self.context(screen, account, int(field(cell, "dialogsType", -1)), int(field(screen, "folderId", 0)))
+        if context:
+            cached = (context[0], context[1], str(did))
+            self.cells[identity(cell)] = cached
+        return cached
+
+    def cell_detached(self, param):
+        self.cells.pop(identity(param.thisObject), None)
+
+    def pin_visual(self, param):
+        if bool(param.getResult()):
+            return  # Preserve every real Telegram pin, including in all mode.
+        context = self.cell_context(param.thisObject)
+        if context and self.model.marked(*context):
+            param.setResult(True)
+
+    def pin_coordinates(self, cell):
+        width = int(cell.getMeasuredWidth())
+        if width <= 0:
+            return
+        drawable = Theme.dialogs_pinnedDrawable
+        left = AndroidUtilities.dp(14.0)
+        if not LocaleController.isRTL:
+            left = width - drawable.getIntrinsicWidth() - left
+        put(cell, "pinLeft", jint(left))
+
+    def action_mode(self, screen):
+        return self.eligible(screen) and bool(screen.getActionBar().isActionModeShowed(None))
+
+    def cell_after(self, param):
+        cell = param.thisObject
+        context = self.cell_context(cell)
+        if context and self.model.fixed(*context):
+            self.pin_coordinates(cell)
+            active = self.action_mode(field(cell, "parentFragment"))
+            put(cell, "drawReorder", active)
+            put(cell, "reorderIconProgress", float(1.0 if active else 0.0))
+
+    def reorder_visual(self, param):
+        cell = param.thisObject
+        context = self.cell_context(cell)
+        if not context or not self.model.fixed(*context):
+            return
+        # getIsPinned is intentionally false for ordinary chats in all mode.
+        # Set only the handle fields; do not force a pin or a time badge.
+        active = bool(param.args[0])
+        put(cell, "drawReorder", active)
+        put(cell, "reorderIconProgress", float(1.0 if active else 0.0))
+        self.pin_coordinates(cell)
+        cell.invalidate()
+        param.setResult(None)
+
+    def selection_changed(self, param):
+        screen = param.thisObject
+        if not self.eligible(screen):
+            return
+        self.remember(screen)
+        self.menu(screen)
+        self.sync_handles(screen)
+
+    def sync_handles(self, screen):
+        active = self.action_mode(screen)
+        for page in field(screen, "viewPages", []) or []:
+            if page is None:
+                continue
+            adapter, recycler = field(page, "dialogsAdapter"), field(page, "listView")
+            if adapter is None or recycler is None:
+                continue
+            adapter.onReorderStateChanged(active)
+            for index in range(recycler.getChildCount()):
+                cell = recycler.getChildAt(index)
+                if isinstance(cell, DialogCell):
+                    cell.onReorderStateChanged(active, False)
+
+    def selected(self, screen):
+        return [str(did) for did in items(field(screen, "selectedDialogs"))]
+
+    def menu(self, screen):
+        action = screen.getActionBar().getActionMode()
+        if action is None:
+            return
+        overflow = action.getItem(0)
+        if overflow is None:
+            return
+        ref = WeakReference(screen)
+        self.menus[identity(action)] = ref
+        definitions = ((FIX_ITEM, "Зафиксировать чаты", True), (UNFIX_ITEM, "Снять фиксацию чатов", False),
+                       (ALL_ITEM, "Все чаты зафиксированы", None))
+        for item_id, title, operation in definitions:
+            if not overflow.hasSubItem(item_id):
+                context = overflow.getContext()
+                icon = context.getResources().getIdentifier("msg_pin" if operation is not False else "msg_unpin", "drawable", context.getPackageName())
+                overflow.addSubItem(item_id, icon, title)
+        selected = self.selected(screen)
+        page = self.current_page(screen)
+        context = self.page_context(screen, page) if page is not None else None
+        allowed = context is not None and bool(selected) and not bool(field(screen, "searchIsShowed", False))
+        all_mode = allowed and self.model.all(context[0])
+        state = self.model.context(*context) if context else None
+        fixed = state["fixed"] if state else {}
+        overflow.setSubItemShown(FIX_ITEM, bool(allowed and not all_mode and any(d not in fixed for d in selected)))
+        overflow.setSubItemShown(UNFIX_ITEM, bool(allowed and not all_mode and any(d in fixed for d in selected)))
+        overflow.setSubItemShown(ALL_ITEM, bool(all_mode))
+
+    def menu_dispatch(self, param):
+        item_id = int(param.args[0])
+        operations = {FIX_ITEM: True, UNFIX_ITEM: False, ALL_ITEM: None}
+        if item_id not in operations:
+            return
+        ref = self.menus.get(identity(param.thisObject))
+        if ref is None or ref.get() is None:
+            return
+        # Native routing handles both normal taps and hold-slide-release in ⋮.
+        param.setResult(None)
+        self.menu_clicked(ref, operations[item_id])
+
+    def menu_clicked(self, ref, operation):
+        if not self.alive:
+            return
+        try:
+            screen = ref.get()
+            if screen is None:
+                return
+            overflow = screen.getActionBar().getActionMode().getItem(0)
+            overflow.closeSubMenu()
+            if operation is None:
+                BulletinHelper.show_info("Чтобы фиксировать чаты по отдельности, выключи «Зафиксировать все» в настройках плагина.", screen)
+                return
+            page = self.current_page(screen)
+            context = self.page_context(screen, page)
+            if context is None:
+                return
+            selected = self.selected(screen)
+            dialogs = screen.getDialogsArray(int(screen.getCurrentAccount()), int(field(page, "dialogsType")), int(field(screen, "folderId", 0)), False)
+            visible = [str(d.id) for d in items(dialogs) if normal_dialog(d)]
+            if operation:
+                self.model.fix(*context, visible, selected)
+            else:
+                self.model.unfix(*context, selected)
+            self.flush()
+            screen.getActionBar().getActionBarMenuOnItemClick().onItemClick(-1)
+            self.refresh(screen)
+            BulletinHelper.show_success("Чаты зафиксированы на своих местах" if operation else "Фиксация снята", screen)
+        except Exception:
+            self.error("Выбор чатов")
+            BulletinHelper.show_error("Не удалось изменить фиксацию. Подробности — в диагностике плагина.")
+
+    def callback_context(self, callback):
+        page = field(callback, "parentPage")
+        screen = field(callback, "this$0")
+        context = self.page_context(screen, page) if screen is not None and page is not None else None
+        return screen, page, context
+
+    def movement(self, param):
+        callback = param.thisObject
+        screen, page, context = self.callback_context(callback)
+        if context is None or not self.action_mode(screen) or not bool(field(screen, "allowMoving", False)):
+            return
+        cell = param.args[1].itemView
+        if (not isinstance(cell, DialogCell) or not cell.getDialogId()
+                or DialogObject.isFolderDialogId(int(cell.getDialogId()))
+                or not self.model.fixed(*context, str(cell.getDialogId()))):
+            return
+        if bool(field(screen, "dialogsListFrozen", False)) or bool(field(page, "updating", False)):
+            return
+        animator = field(page, "dialogsItemAnimator")
+        if animator is not None and animator.isRunning():
+            return
+        if bool(field(callback, "swipingFolder", False)) and bool(field(callback, "swipeFolderBack", False)):
+            return
+        container = field(screen, "rightSlidingDialogContainer")
+        layout = field(screen, "parentLayout")
+        if ((container is not None and container.hasFragment()) or (layout is not None and layout.isInPreviewMode())
+                or field(screen, "slidingView") is not None or bool(field(screen, "searchIsShowed", False))):
+            return
+        put(screen, "movingView", cell)
+        cell.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        put(callback, "swipeFolderBack", False)
+        param.setResult(Integer(3 | (3 << 16)))  # ItemTouchHelper.makeMovementFlags(UP | DOWN, 0)
+
+    def update_adapter(self, adapter, recycler):
+        # Both APIs exist in maintained Telegram forks. Use the native diff path
+        # during a drag so the active ViewHolder and its position survive.
+        try:
+            adapter.updateList(None)
+        except Exception:
+            adapter.updateList(recycler, False, 0.0)
+
+    def drag(self, param):
+        screen, page, context = self.callback_context(param.thisObject)
+        if context is None or not self.action_mode(screen):
+            return
+        source, target = param.args[1].itemView, param.args[2].itemView
+        if (not isinstance(source, DialogCell) or not source.getDialogId()
+                or DialogObject.isFolderDialogId(int(source.getDialogId()))
+                or not self.model.fixed(*context, str(source.getDialogId()))):
+            return
+        # Consume the operation before changing state: even an error must never
+        # fall through to native pin metadata updates or Telegram requests.
+        param.setResult(False)
+        if not isinstance(target, DialogCell) or DialogObject.isFolderDialogId(int(target.getDialogId())):
+            return
+        adapter = field(page, "dialogsAdapter")
+        dialogs = screen.getDialogsArray(int(screen.getCurrentAccount()), int(field(page, "dialogsType")), int(field(screen, "folderId", 0)), False)
+        visible = [str(d.id) for d in items(dialogs) if normal_dialog(d)]
+        if self.model.move(*context, visible, str(source.getDialogId()), str(target.getDialogId())):
+            recycler = field(page, "listView")
+            if recycler.getItemAnimator() is None:
+                recycler.setItemAnimator(field(page, "dialogsItemAnimator"))
+            self.update_adapter(adapter, recycler)
+            self.save_later()
+            param.setResult(True)
+
+    def native_move(self, param):
+        """Keep genuine Telegram pin dragging correct when the UI is a copy."""
+        adapter = param.thisObject
+        screen = field(adapter, "parentFragment")
+        account, dtype, folder = int(field(adapter, "currentAccount", -1)), int(field(adapter, "dialogsType", -1)), int(field(adapter, "folderId", 0))
+        if account < 0:
+            return
+        context = self.context(screen, account, dtype, folder)
+        if context is None or not self.model.context(*context):
+            return
+        first = adapter.getItem(int(param.args[1]))
+        second = adapter.getItem(int(param.args[2]))
+        if first is None or second is None or not normal_dialog(first) or not normal_dialog(second):
+            return
+        raw = self.raw_dialogs(screen, account, dtype, folder)
+        positions = {str(d.id): i for i, d in enumerate(items(raw))}
+        if str(first.id) not in positions or str(second.id) not in positions:
+            return
+        param.setResult(None)
+        if dtype in (7, 8):
+            filt = MessagesController.getInstance(account).selectedDialogFilter[1 if dtype == 8 else 0]
+            a, b = filt.pinnedDialogs.get(first.id), filt.pinnedDialogs.get(second.id)
+            filt.pinnedDialogs.put(first.id, b)
+            filt.pinnedDialogs.put(second.id, a)
+        else:
+            a, b = int(first.pinnedNum), int(second.pinnedNum)
+            first.pinnedNum, second.pinnedNum = b, a
+        i, j = positions[str(first.id)], positions[str(second.id)]
+        raw.set(i, second)
+        raw.set(j, first)
+        self.update_adapter(adapter, param.args[0])
+
+    def bootstrap(self):
+        if not self.alive:
+            return
+        screen = get_last_fragment()
+        if self.eligible(screen):
+            self.remember(screen)
+            self.refresh(screen)
+
+    def resumed(self, param):
+        self.remember(param.thisObject)
+        if self.eligible(param.thisObject):
+            self.refresh(param.thisObject)
+
+    def refresh(self, screen):
+        if not self.eligible(screen):
+            return
+        for page in field(screen, "viewPages", []) or []:
+            if page is None:
+                continue
+            adapter, recycler = field(page, "dialogsAdapter"), field(page, "listView")
+            if adapter is None:
+                continue
+            adapter.notifyDataSetChanged()
+            if recycler is not None:
+                for index in range(recycler.getChildCount()):
+                    cell = recycler.getChildAt(index)
+                    if isinstance(cell, DialogCell):
+                        cell.buildLayout()
+                        cell.invalidate()
+        if self.alive:
+            self.menu(screen)
+        self.sync_handles(screen)
+
+    def refresh_all(self):
+        for key, ref in list(self.screens.items()):
+            screen = ref.get()
+            if screen is None:
+                self.screens.pop(key, None)
+            else:
+                try:
+                    self.refresh(screen)
+                except Exception:
+                    self.error("Обновление списка")
+
+    def save_later(self):
+        if self.model.dirty and not self.save_pending:
+            self.save_pending = True
+            run_on_ui_thread(self.flush, 250)
+
+    def flush(self):
+        self.save_pending = False
+        if self.model.dirty:
+            self.set_setting(STATE_KEY, self.model.dump())
+            self.model.dirty = False
+
+    def snapshots(self, account, uid):
+        controller = MessagesController.getInstance(account)
+        result = {}
+        for folder in (0, 1):
+            ids = [str(d.id) for d in items(controller.getDialogs(folder)) if normal_dialog(d)]
+            result["folder:" + str(folder)] = self.model.arrange(uid, "folder:" + str(folder), ids)
+        for filt in items(field(controller, "dialogFilters")):
+            key = "filter:" + str(filt.id)
+            ids = [str(d.id) for d in items(field(filt, "dialogs")) if normal_dialog(d)]
+            result[key] = self.model.arrange(uid, key, ids)
+        return result
+
+    def set_all(self, account, uid, enabled):
+        if not self.alive:
+            return
+        try:
+            snapshots = self.snapshots(account, uid) if enabled else {}
+            self.model.set_all(uid, bool(enabled), snapshots)
+            self.flush()
+            self.refresh_all()
+            BulletinHelper.show_success("Все чаты зафиксированы. Дополнительные булавки скрыты." if enabled else "Общий режим выключен. Отдельные фиксации сохранены.")
+        except Exception:
+            self.error("Зафиксировать все")
+            BulletinHelper.show_error("Не удалось изменить режим. Открой диагностику плагина.")
+
+    def clear(self, uid):
+        self.model.clear(uid)
+        self.set_setting("freeze_all_" + uid, False, reload_settings=True)
+        self.flush()
+        self.refresh_all()
+        BulletinHelper.show_success("Вся фиксация для этого аккаунта снята")
+
+    def diagnostics(self):
+        screen = get_last_fragment()
+        if screen is None:
+            return
+        report = "Фиксация чатов " + __version__ + "\nОбработчиков: " + str(len(self.position_hooks))
+        report += "\nАккаунтов с настройками: " + str(len(self.model.data["accounts"]))
+        report += "\n\n" + ("\n\n".join(self.errors) if self.errors else "Ошибок не зарегистрировано.")
+        builder = AlertDialogBuilder(screen.getParentActivity())
+        builder.set_title("Диагностика")
+        builder.set_message(report)
+        builder.set_positive_button("Закрыть", lambda dialog, which: dialog.dismiss())
+        builder.set_neutral_button("Копировать", lambda dialog, which: copy_to_clipboard(report))
+        builder.show()
+
+    def create_settings(self):
+        account = int(UserConfig.selectedAccount)
+        uid = str(UserConfig.getInstance(account).getClientUserId())
+        return [
+            Header(text="Фиксация чатов"),
+            Switch(key="freeze_all_" + uid, text="Зафиксировать все", default=self.model.all(uid),
+                   subtext="Для текущего аккаунта. В каждой папке свой порядок. Новые чаты добавляются в конец; дополнительные булавки скрыты.",
+                   on_change=lambda value: run_on_ui_thread(lambda: self.set_all(account, uid, bool(value)))),
+            Text(text="Как зафиксировать отдельные чаты", subtext="Зажми чат или выдели несколько → ⋮ → Зафиксировать чаты. Булавка появится рядом со временем."),
+            Text(text="Как изменить порядок", subtext="Выдели чат, затем зажми ручку ≡ и перетащи. Позиции сохраняются после перезапуска."),
+            Divider(text="При выключении общего режима возвращаются отдельные фиксации. Порядок действует только в этом приложении."),
+            Text(text="Снять всю фиксацию", red=True, on_click=lambda view: self.clear(uid)),
+            Text(text="Диагностика", on_click=lambda view: self.diagnostics()),
+        ]
+
+    def on_plugin_unload(self):
+        self.flush()
+        self.alive = False
+        for hook in self.position_hooks:
+            self.unhook_method(hook)
+        self.position_hooks.clear()
+        self.cells.clear()
+        # Restore native badges, handles and chronological list immediately.
+        for ref in self.screens.values():
+            screen = ref.get()
+            if screen is not None:
+                action = screen.getActionBar().getActionMode()
+                overflow = action.getItem(0) if action is not None else None
+                if overflow is not None:
+                    for item_id in (FIX_ITEM, UNFIX_ITEM, ALL_ITEM):
+                        if overflow.hasSubItem(item_id):
+                            overflow.hideSubItem(item_id)
+        run_on_ui_thread(self.refresh_all)
